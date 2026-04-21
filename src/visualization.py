@@ -1,30 +1,44 @@
 """
-Static charts answering the four analytical questions.
+Static charts and geospatial maps answering the four analytical questions.
 
 Q1 — Which districts have lower/higher facility and emergency care availability?
 Q2 — Which districts show weaker populated-centre access to emergency services?
 Q3 — Which districts appear most/least underserved when combining all factors?
 Q4 — How sensitive are results to alternative methodological definitions?
 
+Geospatial outputs
+------------------
+  Static choropleths (matplotlib/geopandas) — 4 maps on one figure
+  Interactive map (Folium)                  — HTML with choropleth + tooltips
+
 Inputs : output/tables/district_metrics.csv  (or a pre-loaded DataFrame)
-Outputs: output/figures/  (PNG, 150 dpi)
+         data/processed/districts_summary.gpkg
+         data/processed/centros_nearest_facility.gpkg  (optional)
+Outputs: output/figures/  (PNG 150 dpi + HTML)
 """
 
 from pathlib import Path
 
+import folium
+import geopandas as gpd
+import matplotlib.cm as cm
+import matplotlib.colors as mcolors
+import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import numpy as np
 import pandas as pd
 import seaborn as sns
+from folium.plugins import FloatImage
 from scipy.stats import spearmanr
 
 # ---------------------------------------------------------------------------
 # Paths & style
 # ---------------------------------------------------------------------------
-ROOT    = Path(__file__).resolve().parents[1]
-TABLES  = ROOT / "output" / "tables"
-FIGURES = ROOT / "output" / "figures"
+ROOT      = Path(__file__).resolve().parents[1]
+PROCESSED = ROOT / "data" / "processed"
+TABLES    = ROOT / "output" / "tables"
+FIGURES   = ROOT / "output" / "figures"
 FIGURES.mkdir(parents=True, exist_ok=True)
 
 METRICS_CSV = TABLES / "district_metrics.csv"
@@ -448,11 +462,304 @@ def plot_q4_sensitivity(df: pd.DataFrame) -> list[Path]:
 
 
 # ---------------------------------------------------------------------------
+# NumPy-2-safe GeoJSON serialiser
+# (geopandas __geo_interface__ / to_json use np.array(copy=False) which
+#  raises on NumPy ≥ 2.0 with fiona < 2.  shapely.mapping avoids that path.)
+# ---------------------------------------------------------------------------
+def _gdf_to_geojson(gdf: gpd.GeoDataFrame) -> dict:
+    """Convert a GeoDataFrame to a plain GeoJSON dict without __geo_interface__."""
+    from shapely.geometry import mapping
+
+    features = []
+    prop_cols = [c for c in gdf.columns if c != gdf.geometry.name]
+    for _, row in gdf.iterrows():
+        geom = row[gdf.geometry.name]
+        if geom is None or geom.is_empty:
+            continue
+        props = {}
+        for c in prop_cols:
+            v = row[c]
+            # JSON must be serialisable
+            if isinstance(v, float) and np.isnan(v):
+                props[c] = None
+            elif hasattr(v, "item"):          # numpy scalar
+                props[c] = v.item()
+            else:
+                props[c] = v
+        features.append({
+            "type": "Feature",
+            "properties": props,
+            "geometry": mapping(geom),
+        })
+    return {"type": "FeatureCollection", "features": features}
+
+
+# ---------------------------------------------------------------------------
+# Geodata loader  (merges geometry with computed metrics)
+# ---------------------------------------------------------------------------
+def load_geodata(df: pd.DataFrame | None = None) -> gpd.GeoDataFrame | None:
+    """
+    Merge district_metrics with districts_summary geometry.
+    Returns None if the GeoPackage is missing.
+    """
+    gpkg = PROCESSED / "districts_summary.gpkg"
+    if not gpkg.exists():
+        print(f"  [warn] {gpkg.name} not found — choropleth maps skipped.")
+        return None
+
+    gdf = gpd.read_file(gpkg)
+
+    if df is not None and not df.empty:
+        # ubigeo may be stored as int in shapefile but str in metrics
+        for frame in [gdf, df]:
+            if "ubigeo" in frame.columns:
+                frame["ubigeo"] = frame["ubigeo"].astype(str).str.zfill(6)
+
+        metric_cols = [c for c in df.columns if c not in gdf.columns or c == "ubigeo"]
+        gdf = gdf.merge(df[metric_cols], on="ubigeo", how="left")
+
+    if gdf.crs is None:
+        gdf = gdf.set_crs("EPSG:4326")
+    elif gdf.crs.to_epsg() != 4326:
+        gdf = gdf.to_crs("EPSG:4326")
+
+    print(f"  Geodata: {len(gdf):,} districts, CRS={gdf.crs.to_epsg()}")
+    return gdf
+
+
+# ---------------------------------------------------------------------------
+# Static choropleths  (matplotlib / geopandas)
+# ---------------------------------------------------------------------------
+_CHOROPLETH_SPECS = [
+    # (column, title, colormap, unit_label, log_scale)
+    ("density_ipress_per100km2",  "IPRESS density\n(per 100 km²)",   "YlOrRd", "facilities", False),
+    ("total_emergencias",         "Emergency volume\n(total)",         "Blues",  "emergencies", True),
+    ("mean_dist_nearest_m",       "Mean distance to\nnearest IPRESS",  "RdPu",  "metres",       True),
+    ("baseline_index",            "Underservice index\n(baseline)",    "Reds",  "0–1 score",   False),
+]
+
+
+def plot_choropleth_maps(
+    gdf: gpd.GeoDataFrame,
+    df_metrics: pd.DataFrame | None = None,
+) -> list[Path]:
+    """
+    2 × 2 grid of static district-level choropleth maps.
+    Each panel maps one metric; missing values shown in light grey.
+    """
+    saved = []
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 18))
+    fig.suptitle(
+        "Emergency healthcare access across Peruvian districts",
+        fontsize=14, fontweight="bold", y=1.005,
+    )
+
+    for ax, (col, title, cmap_name, unit, log) in zip(
+        axes.flat, _CHOROPLETH_SPECS
+    ):
+        if col not in gdf.columns or gdf[col].notna().sum() == 0:
+            ax.set_title(f"{title}\n(no data)", fontsize=9)
+            ax.axis("off")
+            continue
+
+        s = gdf[col].copy()
+
+        # Colour normalisation
+        valid = s.dropna()
+        if log and (valid > 0).any():
+            vmin = max(valid[valid > 0].quantile(0.02), 1e-6)
+            vmax = valid.quantile(0.98)
+            norm = mcolors.LogNorm(vmin=vmin, vmax=vmax)
+        else:
+            vmin = valid.quantile(0.02)
+            vmax = valid.quantile(0.98)
+            norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+
+        cmap = cm.get_cmap(cmap_name)
+        missing_color = "#D5D8DC"
+
+        # Split into rows with and without values
+        has_val = gdf[s.notna()]
+        no_val  = gdf[s.isna()]
+
+        if not no_val.empty:
+            no_val.plot(ax=ax, color=missing_color, linewidth=0.05)
+        if not has_val.empty:
+            has_val.plot(
+                ax=ax, column=col, cmap=cmap_name,
+                norm=norm, linewidth=0.05, edgecolor="white",
+            )
+
+        # Colorbar
+        sm = cm.ScalarMappable(cmap=cmap, norm=norm)
+        sm.set_array([])
+        cbar = fig.colorbar(sm, ax=ax, fraction=0.03, pad=0.02, shrink=0.7)
+        cbar.set_label(unit, fontsize=7)
+        cbar.ax.tick_params(labelsize=6)
+
+        # Legend patch for missing
+        if not no_val.empty:
+            patch = mpatches.Patch(color=missing_color, label="No data")
+            ax.legend(handles=[patch], fontsize=6, loc="lower left")
+
+        ax.set_title(title, fontsize=10, fontweight="bold")
+        ax.axis("off")
+
+    fig.tight_layout()
+    saved.append(_save(fig, "geo_choropleths"))
+    return saved
+
+
+# ---------------------------------------------------------------------------
+# Interactive Folium map
+# ---------------------------------------------------------------------------
+_FOLIUM_COLS = {
+    "baseline_index":            ("Underservice index (baseline)",  "YlOrRd"),
+    "density_ipress_per100km2":  ("IPRESS density / 100 km²",       "Blues"),
+    "mean_dist_nearest_m":       ("Mean dist. to nearest IPRESS (m)","PuRd"),
+    "total_emergencias":         ("Total emergencies",               "BuPu"),
+}
+
+_TOOLTIP_COLS = [
+    "distrito", "departamen", "ubigeo",
+    "baseline_index", "density_ipress_per100km2",
+    "mean_dist_nearest_m", "total_emergencias",
+    "n_ipress_minsa", "n_renipress_susalud",
+]
+
+
+def plot_folium_interactive(
+    gdf: gpd.GeoDataFrame,
+    centros: gpd.GeoDataFrame | None = None,
+) -> list[Path]:
+    """
+    Build a multi-layer Folium map:
+      • Choropleth layers for each metric (togglable)
+      • Optional populated-centre markers (sub-sampled for performance)
+      • District tooltip on hover
+    Saved as HTML to output/figures/.
+    """
+    saved = []
+
+    # Centre map on Peru
+    m = folium.Map(
+        location=[-9.5, -75.0],
+        zoom_start=6,
+        tiles="CartoDB positron",
+        control_scale=True,
+    )
+
+    # Convert to WGS84, simplify polygons to keep HTML size manageable
+    geo = gdf.to_crs("EPSG:4326").copy()
+    geo["ubigeo"] = geo["ubigeo"].astype(str).str.zfill(6)
+    geo["geometry"] = geo["geometry"].simplify(tolerance=0.01, preserve_topology=True)
+
+    # Tooltip fields (keep only those present)
+    tt_cols = [c for c in _TOOLTIP_COLS if c in geo.columns]
+    tooltip_fields  = tt_cols
+    tooltip_aliases = [c.replace("_", " ").title() + ":" for c in tt_cols]
+
+    # Build GeoJSON once (reused by all layers)
+    geo_json = _gdf_to_geojson(geo)
+    tooltip_json = _gdf_to_geojson(geo[tt_cols + ["geometry"]])
+
+    # --- Choropleth layers ---
+    # Choropleth must be added directly to the Map (not inside a FeatureGroup).
+    # The `show` kwarg controls which layer is visible on load.
+    first = True
+    for col, (layer_name, palette) in _FOLIUM_COLS.items():
+        if col not in geo.columns or geo[col].notna().sum() == 0:
+            continue
+
+        data_series = geo[["ubigeo", col]].dropna()
+
+        choropleth = folium.Choropleth(
+            geo_data=geo_json,
+            data=data_series,
+            columns=["ubigeo", col],
+            key_on="feature.properties.ubigeo",
+            fill_color=palette,
+            fill_opacity=0.75,
+            line_opacity=0.15,
+            line_color="white",
+            nan_fill_color="#EEEEEE",
+            nan_fill_opacity=0.4,
+            legend_name=layer_name,
+            name=layer_name,
+            show=first,
+            highlight=True,
+        )
+        choropleth.add_to(m)
+        first = False
+
+    # Invisible GeoJson layer for tooltips on hover (one shared layer)
+    folium.GeoJson(
+        tooltip_json,
+        name="District tooltips",
+        style_function=lambda _: {"fillOpacity": 0, "weight": 0},
+        tooltip=folium.GeoJsonTooltip(
+            fields=tooltip_fields,
+            aliases=tooltip_aliases,
+            localize=True,
+            sticky=False,
+            labels=True,
+            style=(
+                "background-color: white; color: #333; "
+                "font-family: Arial; font-size: 11px; padding: 6px;"
+            ),
+        ),
+        highlight_function=lambda _: {"weight": 2, "color": "#333333"},
+        show=True,
+    ).add_to(m)
+
+    # --- Populated centres layer (sub-sampled, up to 300 points) ---
+    if centros is not None and not centros.empty:
+        cc = centros.to_crs("EPSG:4326").copy()
+        if len(cc) > 300:
+            cc = cc.sample(300, random_state=42)
+
+        cc_fg = folium.FeatureGroup(name="Populated centres (sample)", show=False)
+        for _, row in cc.iterrows():
+            if row.geometry is None:
+                continue
+            pop = row.get("poblacion", "?")
+            dist_km = (
+                f"{row['dist_nearest_m'] / 1000:.1f} km"
+                if "dist_nearest_m" in cc.columns and pd.notna(row.get("dist_nearest_m"))
+                else "N/A"
+            )
+            folium.CircleMarker(
+                location=[row.geometry.y, row.geometry.x],
+                radius=3,
+                color="#2980B9",
+                fill=True,
+                fill_color="#2980B9",
+                fill_opacity=0.6,
+                weight=0.5,
+                tooltip=(
+                    f"<b>{row.get('nombre_centro_poblado', 'Centro')}</b><br>"
+                    f"Population: {pop}<br>"
+                    f"Dist. nearest IPRESS: {dist_km}"
+                ),
+            ).add_to(cc_fg)
+        cc_fg.add_to(m)
+
+    folium.LayerControl(collapsed=False).add_to(m)
+
+    out = FIGURES / "interactive_map.html"
+    m.save(str(out))
+    print(f"  Saved → {out.name}  ({out.stat().st_size:,} bytes)")
+    saved.append(out)
+    return saved
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 def run_visualization_pipeline(df: pd.DataFrame | None = None) -> list[Path]:
     """
-    Generate all static figures for the four analytical questions.
+    Generate all static figures and geospatial maps.
 
     Parameters
     ----------
@@ -461,7 +768,7 @@ def run_visualization_pipeline(df: pd.DataFrame | None = None) -> list[Path]:
 
     Returns
     -------
-    List of Path objects for every saved figure.
+    List of Path objects for every saved figure / map.
     """
     print("=== Visualization Pipeline ===\n")
     df = load_metrics(df)
@@ -481,7 +788,19 @@ def run_visualization_pipeline(df: pd.DataFrame | None = None) -> list[Path]:
     print("\n[Q4] Sensitivity: baseline vs alternative …")
     all_saved += plot_q4_sensitivity(df)
 
-    print(f"\n=== Done — {len(all_saved)} figures saved to {FIGURES} ===")
+    print("\n[Geo] Loading geodata …")
+    gdf = load_geodata(df)
+
+    if gdf is not None:
+        print("[Geo] Static choropleth maps …")
+        all_saved += plot_choropleth_maps(gdf, df)
+
+        print("[Geo] Interactive Folium map …")
+        centros_path = PROCESSED / "centros_nearest_facility.gpkg"
+        centros = gpd.read_file(centros_path) if centros_path.exists() else None
+        all_saved += plot_folium_interactive(gdf, centros)
+
+    print(f"\n=== Done — {len(all_saved)} outputs saved to {FIGURES} ===")
     return all_saved
 
 
