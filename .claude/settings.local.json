@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(gh issue *)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:www.datosabiertos.gob.pe)",
+      "WebFetch(domain:datos.susalud.gob.pe)",
+      "WebSearch",
+      "Bash(conda run *)",
+      "Bash(/c/Users/51950/anaconda3/envs/geo/python.exe *)",
+      "Bash(PYTHONIOENCODING=utf-8 /c/Users/51950/anaconda3/envs/geo/python.exe *)"
+    ]
+  }
+}
