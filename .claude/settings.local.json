@@ -10,7 +10,9 @@
       "Bash(/c/Users/51950/anaconda3/envs/geo/python.exe *)",
       "Bash(PYTHONIOENCODING=utf-8 /c/Users/51950/anaconda3/envs/geo/python.exe *)",
       "Bash(git -C /c/Users/51950/Documents/GitHub/Scraping_data/emergency_access_peru diff HEAD -- src/geospatial.py src/cleaning.py)",
-      "Bash(git *)"
+      "Bash(git *)",
+      "Bash(curl -s http://localhost:8501/healthz)",
+      "Bash(curl -s http://localhost:8501/_stcore/health)"
     ]
   }
 }
